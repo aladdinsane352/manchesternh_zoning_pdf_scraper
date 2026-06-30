@@ -387,74 +387,55 @@ def fetch_legistar_links(url: str, board_filter=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def fetch_civicclerk_links(url: str) -> list[dict]:
-    """Fetch agenda links from a CivicClerk portal.
+    """Fetch published files from a CivicClerk portal via its OData API.
 
-    Tries REST API endpoints first; falls back to HTML scraping for
-    View.ashx?M=A agenda links if the API is unavailable.
+    The portal URL has the form https://{tenant}.portal.civicclerk.com/?category_id=38,77.
+    The actual data lives at https://{tenant}.api.civicclerk.com/v1/Events.
+    Published files (agendas, packets, minutes, notices) are in each event's
+    publishedFiles array; download URLs are relative to the portal base.
     """
     import requests
     print(f"Fetching CivicClerk: {url}")
     parsed = urllib.parse.urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
+    portal_base = f"{parsed.scheme}://{parsed.netloc}"
+    # Extract tenant from hostname: "nashuanh.portal.civicclerk.com" -> "nashuanh"
+    tenant = parsed.hostname.split(".")[0]
     qs = urllib.parse.parse_qs(parsed.query)
-    category_ids = qs.get("category_id", [""])[0]
-    current_year = datetime.date.today().year
+    category_ids = [c.strip() for c in qs.get("category_id", [""])[0].split(",") if c.strip()]
 
-    # Try known CivicClerk API endpoints
-    for api_path in ("/api/v2/PublicMeetings", "/api/v2/events", "/api/events", "/api/v1/events"):
+    api_base = f"https://{tenant}.api.civicclerk.com/v1/Events"
+    links = []
+
+    for cat_id in category_ids:
+        api_url = f"{api_base}?%24filter=categoryId+eq+{cat_id}&%24orderby=eventDate+desc"
         try:
             r = requests.get(
-                base + api_path,
-                params={"category_id": category_ids, "year": current_year},
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-                timeout=15,
+                api_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; PDF-Scraper/1.0)", "Accept": "application/json"},
+                timeout=30,
             )
-            if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
-                data = r.json()
-                items = data if isinstance(data, list) else data.get("items", data.get("data", []))
-                links = []
-                for item in items:
-                    agenda_url = (item.get("agendaUrl") or item.get("agenda_url")
-                                  or item.get("AgendaFile") or "")
-                    if not agenda_url:
-                        continue
-                    title = item.get("title") or item.get("name") or item.get("Name", "Meeting")
-                    date_val = str(item.get("date") or item.get("meetingDate") or item.get("EventDate", ""))
-                    year = int(date_val[:4]) if len(date_val) >= 4 and date_val[:4].isdigit() else current_year
-                    if year != current_year:
-                        continue
-                    links.append({"url": agenda_url, "title": title, "year": year, "source_url": url})
-                if links:
-                    print(f"  Found {len(links)} agenda items via API ({api_path})")
-                    return links
-        except Exception:
-            pass
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"  [err] CivicClerk API failed for category {cat_id}: {e}", file=sys.stderr)
+            continue
 
-    # Fall back to HTML scraping for View.ashx agenda links
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        links = []
-        seen: set[str] = set()
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if "View.ashx" in href and "M=A" in href:
-                full_url = href if href.startswith("http") else base + href
-                if full_url in seen:
+        for event in data.get("value", []):
+            event_date = event.get("eventDate", "")[:10]
+            event_name = event.get("eventName", "Meeting")
+            year = int(event_date[:4]) if len(event_date) >= 4 and event_date[:4].isdigit() else None
+            for f in event.get("publishedFiles", []):
+                file_url = f.get("url", "")
+                if not file_url:
                     continue
-                seen.add(full_url)
-                title = a_tag.get_text(strip=True) or "Agenda"
-                links.append({"url": full_url, "title": title, "year": current_year, "source_url": url})
-        if links:
-            print(f"  Found {len(links)} agenda links via HTML scraping")
-            return links
-    except Exception as e:
-        print(f"  [warn] CivicClerk HTML scraping failed: {e}", file=sys.stderr)
+                full_url = f"{portal_base}/{file_url}"
+                file_type = f.get("type", "")
+                file_name = f.get("name", "")
+                title = f"{event_name} — {file_name or file_type} ({event_date})"
+                links.append({"url": full_url, "title": title, "year": year, "source_url": url})
 
-    print(f"  [warn] Could not retrieve CivicClerk data from {url} — page may require JavaScript",
-          file=sys.stderr)
-    return []
+    print(f"  Found {len(links)} published files via OData API")
+    return links
 
 
 # ---------------------------------------------------------------------------
